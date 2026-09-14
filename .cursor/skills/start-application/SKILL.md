@@ -19,6 +19,24 @@ Use `/Users/michaelacsamana/Documents/metasfresh` as the repository root.
 2. Prefer the existing repo commands over inventing new startup scripts.
 3. Keep long-running servers in background shell jobs and do one immediate smoke check to ensure they started.
 4. Use project name `metasfresh-local-weird` for Docker Compose so the containers are easy to identify and do not collide with other compose projects.
+5. Stop conflicting old metasfresh processes first:
+
+```bash
+# Stop the old metasfresh frontend dev server if it is still bound to port 3000.
+for pid in $(lsof -ti tcp:3000); do
+  cmd=$(ps -p "$pid" -o command=)
+  case "$cmd" in
+    *node*server.js*|*metasfresh/frontend*)
+      kill "$pid"
+      ;;
+  esac
+done
+
+# Stop the old default compose project if it exists. This preserves volumes.
+docker compose -f docker-builds/compose/compose.yml down
+```
+
+If port `3000` is used by something unrelated, such as `grafana-agent`, do not kill it.
 
 ## Nonstandard Local Ports
 
@@ -105,17 +123,43 @@ services:
 EOF
 ```
 
-4. Start the login-ready services:
+4. Start infrastructure services first:
 
 ```bash
 docker compose \
   -p metasfresh-local-weird \
   -f docker-builds/compose/compose.yml \
   -f /tmp/metasfresh-compose-weird-ports.yml \
-  up -d db rabbitmq search app webapi webui mobile
+  up -d db rabbitmq search
 ```
 
-5. Verify startup:
+5. Wait for the DB to become healthy:
+
+```bash
+docker compose -p metasfresh-local-weird \
+  -f docker-builds/compose/compose.yml \
+  -f /tmp/metasfresh-compose-weird-ports.yml ps
+```
+
+6. Set the backend CORS/frontend origin in the DB. This is required because the preloaded DB defaults `webui.frontend.url` to `http://localhost:3000`, which causes CORS failures from `http://localhost:13000`:
+
+```bash
+docker exec metasfresh-local-weird-db-1 \
+  psql -U metasfresh -d metasfresh -v ON_ERROR_STOP=1 \
+  -c "UPDATE AD_SysConfig SET Value='http://localhost:13000', Updated=now(), UpdatedBy=100 WHERE Name='webui.frontend.url';"
+```
+
+7. Start the app, web API, web UI, and mobile UI:
+
+```bash
+docker compose \
+  -p metasfresh-local-weird \
+  -f docker-builds/compose/compose.yml \
+  -f /tmp/metasfresh-compose-weird-ports.yml \
+  up -d app webapi webui mobile
+```
+
+8. Verify startup:
 
 ```bash
 docker compose \
@@ -130,6 +174,7 @@ Then probe:
 ```bash
 curl -fsS http://localhost:18080/health
 curl -fsS http://localhost:13000/
+curl -i -s -H 'Origin: http://localhost:13000' http://localhost:18080/rest/api/login/availableLanguages | grep -i 'Access-Control-Allow-Origin'
 ```
 
 If the images are missing, Docker will pull them. On Apple Silicon, linux/amd64 platform warnings are expected for these images.
@@ -147,6 +192,21 @@ docker compose \
 ```
 
 This removes containers and the compose network but preserves Docker volumes. Do not use `down -v` unless the user explicitly asks to reset/delete local app data.
+
+Also stop any old default metasfresh stack and frontend dev server if present:
+
+```bash
+docker compose -f docker-builds/compose/compose.yml down
+
+for pid in $(lsof -ti tcp:3000); do
+  cmd=$(ps -p "$pid" -o command=)
+  case "$cmd" in
+    *node*server.js*|*metasfresh/frontend*)
+      kill "$pid"
+      ;;
+  esac
+done
+```
 
 ## Docker Stack Reset
 
@@ -251,7 +311,9 @@ While starting the app, give short progress updates:
 - Existing process found, reusing it.
 - Creating weird-port Docker override.
 - Pulling Docker images.
-- Starting Docker services.
+- Starting Docker infrastructure.
+- Setting backend frontend URL/CORS origin.
+- Starting app and web services.
 - Waiting for API health.
 
 While shutting down the app, give short progress updates:
